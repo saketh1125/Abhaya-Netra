@@ -339,6 +339,7 @@ class MainActivity : AppCompatActivity() {
             synchronized(scoreBuffer) { scoreBuffer.clear() } // Reset score buffer
             currentRiskLevel = RiskLevel.LOW // Reset risk state
             sessionStats.reset() // Reset session stats
+            tfliteInterpreter?.resetVariableTensors() // Optional: cleaner state
             Log.i("SESSION_LOG", "Session reset for VIDEO mode")
             
             // hide banner
@@ -456,71 +457,107 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processVideo(videoUri: Uri) {
-        val statusTextView = findViewById<TextView>(R.id.statusTextView) // Re-fetch or use member if ViewBinding
-        currentProcessingJob?.cancel() // Cancel previous job if any
+        val statusTextView = findViewById<TextView>(R.id.statusTextView)
+        currentProcessingJob?.cancel()
 
         currentProcessingJob = processingScope.launch(Dispatchers.Default) {
-             val retriever = MediaMetadataRetriever()
-             try {
-                 retriever.setDataSource(this@MainActivity, videoUri)
-                 val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                 val durationMs = durationStr?.toLongOrNull() ?: 0L
-                 
-                 Log.i("DeepfakeAI", "Starting processing for video length: ${durationMs}ms")
-                 
-                 var currentTimeMs = 0L
-                 val intervalMs = 300L // 300ms interval
-                 
-                 while (currentTimeMs < durationMs && isActive) {
-                     // getFrameAtTime takes microseconds
-                     val bitmap = retriever.getFrameAtTime(currentTimeMs * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                     sessionStats.framesProcessed++ // Track frame
-                     
-                     if (bitmap != null) {
-                         withContext(Dispatchers.Main) {
-                             statusTextView.text = "Processing frame at ${currentTimeMs}ms..."
-                             
-                             faceDetectorHelper?.detectFace(
-                                 bitmap = bitmap,
-                                 onSuccess = { bounds ->
-                                     if (bounds != null) {
-                                         sessionStats.facesDetected++ // Track face
-                                         Log.i("FACE_DETECTION", "timestamp=${currentTimeMs}ms — FACE DETECTED bbox=$bounds")
-                                         statusTextView.text = "Face detected at ${currentTimeMs}ms ✅"
-                                         
-                                         // Preprocess
-                                         processingScope.launch(Dispatchers.Default) {
-                                             preprocessFaceForModel(bitmap, bounds)
-                                         }
-                                     } else {
-                                          Log.i("FACE_DETECTION", "timestamp=${currentTimeMs}ms — NO FACE")
-                                          statusTextView.text = "No face detected at ${currentTimeMs}ms ❌"
-                                     }
-                                 },
-                                 onError = { e ->
-                                     Log.e("FACE_DETECTION", "Error detecting face at ${currentTimeMs}ms", e)
-                                 }
-                             )
-                         }
-                     }
-                     
-                     currentTimeMs += intervalMs
-                     delay(10) // Small yield
-                 }
-                 
-                 withContext(Dispatchers.Main) {
-                     statusTextView.text = "Video Processing Complete ✅"
-                 }
-                 
-             } catch (e: Exception) {
-                 Log.e("DeepfakeAI", "Error extracting frames", e)
-                 withContext(Dispatchers.Main) {
-                     statusTextView.text = "Error processing video ❌"
-                 }
-             } finally {
-                 retriever.release()
-             }
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(this@MainActivity, videoUri)
+                val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                val durationMs = durationStr?.toLongOrNull() ?: 0L
+                
+                Log.i("DeepfakeAI", "Starting sequential processing for video length: ${durationMs}ms")
+                
+                var currentTimeMs = 0L
+                val intervalMs = 500L // Increased interval to allow inference breathing room
+                
+                while (currentTimeMs < durationMs && isActive) {
+                    val bitmap = retriever.getFrameAtTime(currentTimeMs * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    
+                    if (bitmap != null) {
+                        try {
+                            sessionStats.framesProcessed++
+                            
+                            withContext(Dispatchers.Main) {
+                                statusTextView.text = "Analyzing frame at ${currentTimeMs/1000}s..."
+                            }
+
+                            // Sequential Wraper: Wait for detection & inference
+                            val faceFound = detectAndProcessFaceSafe(bitmap) {
+                                Log.d("DeepfakeAI", "Frame processing cancelled safely")
+                            }
+                            
+                            if (faceFound) {
+                                withContext(Dispatchers.Main) {
+                                    statusTextView.text = "Face analyzed at ${currentTimeMs}ms ✅"
+                                }
+                            } else {
+                                Log.i("FACE_DETECTION", "No face at ${currentTimeMs}ms")
+                                withContext(Dispatchers.Main) {
+                                    statusTextView.text = "No face at ${currentTimeMs}ms ❌"
+                                }
+                            }
+                        } finally {
+                            // Vital: Recycle bitmap to prevent OOM
+                            bitmap.recycle()
+                        }
+                    }
+                    
+                    currentTimeMs += intervalMs
+                    // No need for delay(10), we waited for processing
+                }
+                
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Video Processing Complete ✅"
+                }
+                
+            } catch (e: CancellationException) {
+                Log.i("DeepfakeAI", "Video processing cancelled")
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Processing stopped"
+                }
+            } catch (e: Exception) {
+                Log.e("DeepfakeAI", "Error processing video", e)
+                withContext(Dispatchers.Main) {
+                    statusTextView.text = "Error processing video: ${e.message}"
+                }
+            } finally {
+                retriever.release()
+            }
         }
+    }
+
+    // New suspend wrapper for face detection + inference
+    private suspend fun detectAndProcessFaceSafe(
+        bitmap: Bitmap, 
+        onCancellation: (() -> Unit)? = null
+    ): Boolean = suspendCancellableCoroutine { continuation ->
+        continuation.invokeOnCancellation { 
+            onCancellation?.invoke()
+        }
+        faceDetectorHelper?.detectFace(
+            bitmap = bitmap,
+            onSuccess = { bounds ->
+                if (bounds != null) {
+                    sessionStats.facesDetected++
+                    try {
+                        processingScope.launch(Dispatchers.Default) {
+                            preprocessFaceForModel(bitmap, bounds)
+                            if (continuation.isActive) continuation.resume(true) {}
+                        }
+                    } catch (e: Exception) {
+                        if (continuation.isActive) continuation.resume(false) {}
+                    }
+                } else {
+                    if (continuation.isActive) continuation.resume(false) {}
+                }
+            },
+            onError = { e ->
+                Log.e("FACE_DETECTION", "Error", e)
+                if (continuation.isActive) continuation.resume(false) {}
+            }
+        )
     }
 
     // Score Smoothing
@@ -575,23 +612,44 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             
-            // 5. Run Inference (or Simulate if model invalid)
-            // Output buffer: [1, 1] assuming binary classification (Real vs Fake or Score 0.0-1.0)
-            val outputBuffer = Array(1) { FloatArray(1) }
+            // CRITICAL: Rewind buffer before inference
+            inputBuffer.rewind()
             
-            // Try actual inference
-            var rawScore = 0.5f
+            // 5. Run Inference
+            // Output buffer: [1, 2] -> [Real, Fake] for EfficientNetV2-B0 with softmax output
+            val outputBuffer = Array(1) { FloatArray(2) }
+            
+            // Run actual inference with safety check
             try {
+                if (tfliteInterpreter == null) {
+                    Log.e("MODEL_INFERENCE", "Interpreter is null, skipping frame")
+                    return
+                }
                 tfliteInterpreter?.run(inputBuffer, outputBuffer)
-                rawScore = outputBuffer[0][0]
             } catch (e: Exception) {
-                // If model fails (likely dummy), simulate a fluctuating score for smoothing demo
-                // Simulate fluctuation around 0.7
-                rawScore = 0.7f + (java.util.Random().nextFloat() * 0.2f - 0.1f)
+                Log.e("MODEL_INFERENCE", "Inference failed: ${e.message}")
+                return
             }
             
-            // 6. Smooth Score
-            val smoothedScore = calculateSmoothedScore(rawScore)
+            // Model outputs SOFTMAX already (probabilities sum to 1)
+            // Output format: [real_probability, fake_probability]
+            val realProb = outputBuffer[0][0]
+            val fakeProb = outputBuffer[0][1]
+            
+            // Log RAW model output BEFORE any processing
+            Log.d("MODEL_RAW_OUTPUT", "Frame ${sessionStats.inferenceCalls}: Raw=[real=${String.format("%.4f", realProb)}, fake=${String.format("%.4f", fakeProb)}]")
+            
+            // Use fake probability directly (model already outputs softmax, NO double-softmax!)
+            val rawScore = fakeProb.coerceIn(0f, 1f)
+            
+            Log.d("MODEL_INFERENCE", "Softmax Output: Real=${String.format("%.4f", realProb)}, Fake=${String.format("%.4f", fakeProb)} -> rawScore=${String.format("%.4f", rawScore)}")
+            
+            // 6. Smooth Score - TEMPORARILY DISABLED FOR DEBUGGING
+            // TODO: Re-enable smoothing after verifying raw inference works
+            // val smoothedScore = calculateSmoothedScore(rawScore)
+            val smoothedScore = rawScore // Use raw score directly for debugging
+            
+            Log.i("SCORE_DEBUG", "RAW=$rawScore SMOOTHED(disabled)=$smoothedScore")
             
             // 7. Evaluate Risk Level with Hysteresis
             val newRiskLevel = evaluateRiskLevel(smoothedScore)
@@ -608,33 +666,39 @@ class MainActivity : AppCompatActivity() {
                 RiskLevel.HIGH -> sessionStats.highRiskCount++
             }
             
-            Log.i("PREPROCESS_FACE", "Valid Crop | TensorBuffer Created")
-            Log.i("SCORE_SMOOTHING", "RAW=$rawScore SMOOTHED=$smoothedScore")
+            Log.i("PREPROCESS_FACE", "Valid Crop | Inference Complete")
             
             // 9. Update UI with Risk Level (Color-coded)
             runOnUiThread {
-                val statusTextView = findViewById<TextView>(R.id.statusTextView)
-                val percentage = (smoothedScore * 100).toInt()
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 
-                // Apply color
-                statusTextView.setTextColor(newRiskLevel.colorHex)
-                
-                // Build message with disclaimer
-                val message = StringBuilder()
-                message.append("${newRiskLevel.displayName}\n")
-                message.append("${newRiskLevel.explanation}\n\n")
-                message.append("Confidence: $percentage%\n")
-                message.append("(This is an automated estimate, not proof.)")
-                
-                statusTextView.text = message.toString()
-                
-                // Update session summary
-                updateSessionSummaryUI()
-                
-                // Update Visual Risk Indicator
-                updateRiskVisuals(newRiskLevel, smoothedScore)
-                
-                Log.i("RISK_UI", "Displayed: ${newRiskLevel.displayName} ($percentage%)")
+                // SAFE UI UPDATE
+                try {
+                    val statusTextView = findViewById<TextView>(R.id.statusTextView)
+                    val percentage = (smoothedScore * 100).toInt()
+                    
+                    // Apply color
+                    statusTextView.setTextColor(newRiskLevel.colorHex)
+                    
+                    // Build message with disclaimer
+                    val message = StringBuilder()
+                    message.append("${newRiskLevel.displayName}\n")
+                    message.append("${newRiskLevel.explanation}\n\n")
+                    message.append("Confidence: $percentage%\n")
+                    message.append("(This is an automated estimate, not proof.)")
+                    
+                    statusTextView.text = message.toString()
+                    
+                    // Update session summary
+                    updateSessionSummaryUI()
+                    
+                    // Update Visual Risk Indicator (ensures internal UI calls are safe)
+                    updateRiskVisuals(newRiskLevel, smoothedScore)
+                    
+                    Log.i("RISK_UI", "Displayed: ${newRiskLevel.displayName} ($percentage%)")
+                } catch (e: Exception) {
+                    Log.e("RISK_UI", "Error updating UI: ${e.message}")
+                }
             }
             
         } catch (e: Exception) {
