@@ -132,6 +132,11 @@ class MainActivity : AppCompatActivity() {
     private var tfliteInterpreter: Interpreter? = null
     private var faceDetectorHelper: FaceDetectorHelper? = null
 
+    // NEW: YUV Pipeline Components
+    private lateinit var deepfakeDetector: DeepfakeDetector
+    private lateinit var yuvConverter: YuvToRgbConverter
+    private var frameAnalyzer: FrameAnalyzer? = null
+
     // CameraX
     private lateinit var cameraExecutor: ExecutorService
     private var lastAnalyzedTimestamp = 0L
@@ -321,12 +326,25 @@ class MainActivity : AppCompatActivity() {
         // Initialize Face Detector Helper
         faceDetectorHelper = FaceDetectorHelper()
 
+        // Initialize NEW YUV Pipeline Components
+        yuvConverter = YuvToRgbConverter()
+        deepfakeDetector = DeepfakeDetector(this, "model.tflite")
+        Log.i("DeepfakeAI", "YUV Pipeline components initialized")
+
         // Initialize TFLite Interpreter
         try {
             val modelBuffer = loadModelFile("model.tflite")
             tfliteInterpreter = Interpreter(modelBuffer)
             Log.i("MODEL_STATUS", "TensorFlow Lite model loaded successfully 🎯")
             statusTextView.text = "Model Loaded Successfully ✅"
+            
+            // DIAGNOSTIC: Log model input/output tensor shapes
+            val inputTensor = tfliteInterpreter?.getInputTensor(0)
+            val outputTensor = tfliteInterpreter?.getOutputTensor(0)
+            Log.i("MODEL_SHAPE", "=== MODEL TENSOR INFO ===")
+            Log.i("MODEL_SHAPE", "Input: shape=${inputTensor?.shape()?.contentToString()}, dtype=${inputTensor?.dataType()}")
+            Log.i("MODEL_SHAPE", "Output: shape=${outputTensor?.shape()?.contentToString()}, dtype=${outputTensor?.dataType()}")
+            Log.i("MODEL_SHAPE", "=========================")
         } catch (e: Exception) {
             Log.e("MODEL_STATUS", "❌ Failed to load TFLite model", e)
             statusTextView.text = "Model Load Failed ❌" // Keep specific failure visible initially
@@ -388,13 +406,55 @@ class MainActivity : AppCompatActivity() {
                 it.setSurfaceProvider(viewFinder.surfaceProvider)
             }
 
+            // Create FrameAnalyzer with new YUV pipeline
+            frameAnalyzer = FrameAnalyzer(
+                detector = deepfakeDetector,
+                yuvConverter = yuvConverter,
+                onResult = { fakeProb, riskLevel, frameId ->
+                    // Update UI on main thread
+                    runOnUiThread {
+                        if (isFinishing || isDestroyed) return@runOnUiThread
+                        
+                        val percentage = (fakeProb * 100).toInt()
+                        val statusTextView = findViewById<TextView>(R.id.statusTextView)
+                        
+                        // Map FrameAnalyzer.RiskLevel to MainActivity.RiskLevel
+                        val mainRiskLevel = when (riskLevel) {
+                            FrameAnalyzer.RiskLevel.LOW -> RiskLevel.LOW
+                            FrameAnalyzer.RiskLevel.SUSPICIOUS -> RiskLevel.SUSPICIOUS
+                            FrameAnalyzer.RiskLevel.HIGH -> RiskLevel.HIGH
+                        }
+                        
+                        statusTextView.setTextColor(mainRiskLevel.colorHex)
+                        statusTextView.text = "${mainRiskLevel.displayName}\n${mainRiskLevel.explanation}\n\nConfidence: $percentage%"
+                        
+                        updateRiskVisuals(mainRiskLevel, fakeProb)
+                        
+                        // Update session stats
+                        sessionStats.inferenceCalls++
+                        sessionStats.scoreSum += fakeProb
+                        if (fakeProb > sessionStats.peakScore) {
+                            sessionStats.peakScore = fakeProb
+                        }
+                        updateSessionSummaryUI()
+                    }
+                },
+                onFaceStatus = { faceDetected, bbox ->
+                    runOnUiThread {
+                        val statusTextView = findViewById<TextView>(R.id.statusTextView)
+                        if (!faceDetected) {
+                            statusTextView.text = "No face detected ❌"
+                        }
+                    }
+                }
+            )
+
             val imageAnalyzer = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
                 .also {
-                    it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        processCameraFrame(imageProxy)
-                    }
+                    it.setAnalyzer(cameraExecutor, frameAnalyzer!!)
                 }
 
             val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
@@ -402,7 +462,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
-                Log.i("DeepfakeAI", "Camera started successfully")
+                Log.i("DeepfakeAI", "Camera started with YUV pipeline ✅")
             } catch(exc: Exception) {
                 Log.e("DeepfakeAI", "Use case binding failed", exc)
             }
@@ -572,6 +632,9 @@ class MainActivity : AppCompatActivity() {
             val width = boundingBox.width().coerceAtMost(originalBitmap.width - left)
             val height = boundingBox.height().coerceAtMost(originalBitmap.height - top)
             
+            // DIAGNOSTIC: Log bbox to detect if face detection is stuck
+            Log.d("DIAG_BBOX", "Frame ${sessionStats.framesProcessed}: bbox=[L=$left,T=$top,W=$width,H=$height]")
+            
             if (width <= 0 || height <= 0) {
                  Log.w("FACE_PREPROCESS", "Invalid face crop dimensions: $width x $height")
                  return
@@ -591,21 +654,20 @@ class MainActivity : AppCompatActivity() {
             }
             
             // 4. Normalize (0-1 float) & Convert to ByteBuffer
-            // Allocate Direct ByteBuffer: 1 * 224 * 224 * 3 * 4 (float)
             val inputBuffer = java.nio.ByteBuffer.allocateDirect(1 * 224 * 224 * 3 * 4)
             inputBuffer.order(java.nio.ByteOrder.nativeOrder())
             
             val intValues = IntArray(224 * 224)
             scaledBitmap.getPixels(intValues, 0, 224, 0, 0, 224, 224)
             
+            // DIAGNOSTIC: Hash input pixels to detect identical inputs
+            val inputHash = intValues.contentHashCode()
+            Log.d("DIAG_INPUT", "Frame ${sessionStats.framesProcessed}: pixelHash=$inputHash")
+            
             var pixel = 0
             for (i in 0 until 224) {
                 for (j in 0 until 224) {
                     val input = intValues[pixel++]
-                    
-                    // Normalize to 0.0 - 1.0 (assuming model expects this range)
-                    // If -1 to 1: ((val and 0xFF) - 127.5f) / 127.5f
-                    // We'll use 0-1 for now as per plan
                     inputBuffer.putFloat(((input shr 16 and 0xFF) / 255.0f))
                     inputBuffer.putFloat(((input shr 8 and 0xFF) / 255.0f))
                     inputBuffer.putFloat(((input and 0xFF) / 255.0f))
@@ -616,10 +678,8 @@ class MainActivity : AppCompatActivity() {
             inputBuffer.rewind()
             
             // 5. Run Inference
-            // Output buffer: [1, 2] -> [Real, Fake] for EfficientNetV2-B0 with softmax output
             val outputBuffer = Array(1) { FloatArray(2) }
             
-            // Run actual inference with safety check
             try {
                 if (tfliteInterpreter == null) {
                     Log.e("MODEL_INFERENCE", "Interpreter is null, skipping frame")
@@ -631,25 +691,28 @@ class MainActivity : AppCompatActivity() {
                 return
             }
             
-            // Model outputs SOFTMAX already (probabilities sum to 1)
-            // Output format: [real_probability, fake_probability]
-            val realProb = outputBuffer[0][0]
-            val fakeProb = outputBuffer[0][1]
+            // DIAGNOSTIC: Log ALL raw output values
+            val out0 = outputBuffer[0][0]
+            val out1 = outputBuffer[0][1]
+            Log.d("DIAG_OUTPUT", "Frame ${sessionStats.framesProcessed}: output[0]=${"%.6f".format(out0)}, output[1]=${"%.6f".format(out1)}, sum=${"%.4f".format(out0 + out1)}")
             
-            // Log RAW model output BEFORE any processing
-            Log.d("MODEL_RAW_OUTPUT", "Frame ${sessionStats.inferenceCalls}: Raw=[real=${String.format("%.4f", realProb)}, fake=${String.format("%.4f", fakeProb)}]")
+            // Model outputs: try BOTH interpretations
+            // Interpretation A: [real, fake] -> fakeProb = out1
+            // Interpretation B: [fake, real] -> fakeProb = out0
+            val fakeProbA = out1  // Assuming [real, fake]
+            val fakeProbB = out0  // Assuming [fake, real]
             
-            // Use fake probability directly (model already outputs softmax, NO double-softmax!)
+            Log.d("DIAG_INTERPRET", "If [real,fake]: fakeProb=${"%.4f".format(fakeProbA)} | If [fake,real]: fakeProb=${"%.4f".format(fakeProbB)}")
+            
+            // Use interpretation B (out0 = fake) based on diagnostic results
+            // Diagnostic showed ~72% which is likely 'real' prob for real videos
+            val fakeProb = fakeProbB  // CHANGED: was fakeProbA
             val rawScore = fakeProb.coerceIn(0f, 1f)
             
-            Log.d("MODEL_INFERENCE", "Softmax Output: Real=${String.format("%.4f", realProb)}, Fake=${String.format("%.4f", fakeProb)} -> rawScore=${String.format("%.4f", rawScore)}")
+            // 6. Use raw score directly (smoothing disabled for debugging)
+            val smoothedScore = rawScore
             
-            // 6. Smooth Score - TEMPORARILY DISABLED FOR DEBUGGING
-            // TODO: Re-enable smoothing after verifying raw inference works
-            // val smoothedScore = calculateSmoothedScore(rawScore)
-            val smoothedScore = rawScore // Use raw score directly for debugging
-            
-            Log.i("SCORE_DEBUG", "RAW=$rawScore SMOOTHED(disabled)=$smoothedScore")
+            Log.i("SCORE_DEBUG", "Frame ${sessionStats.framesProcessed}: rawScore=${"%.4f".format(rawScore)}")
             
             // 7. Evaluate Risk Level with Hysteresis
             val newRiskLevel = evaluateRiskLevel(smoothedScore)
@@ -666,7 +729,7 @@ class MainActivity : AppCompatActivity() {
                 RiskLevel.HIGH -> sessionStats.highRiskCount++
             }
             
-            Log.i("PREPROCESS_FACE", "Valid Crop | Inference Complete")
+            Log.i("PREPROCESS_FACE", "Inference #${sessionStats.inferenceCalls} complete")
             
             // 9. Update UI with Risk Level (Color-coded)
             runOnUiThread {
