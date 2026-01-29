@@ -1,3 +1,32 @@
 <resources>
-    <string name="app_name">DeepfakeAI</string>
+    <string name="app_name">Abhaya-Netra</string>
+    <string name="app_subtitle">Deepfake Detection Agent</string>
+    
+    <!-- Badges -->
+    <string name="status_offline">OFFLINE SEALED</string>
+    <string name="status_on_device">ON-DEVICE</string>
+    
+    <!-- Main Card -->
+    <string name="label_probability">Deepfake Probability</string>
+    <string name="label_risk_level">Risk Assessment</string>
+    <string name="label_inference_note">Based on face-level inference</string>
+    
+    <!-- Status Card -->
+    <string name="label_session_stats">Session Analytics</string>
+    <string name="stat_frames">Frames</string>
+    <string name="stat_faces">Faces</string>
+    <string name="stat_fps">FPS</string>
+    
+    <!-- Actions -->
+    <string name="action_select_video">Select Video Evidence</string>
+    <string name="action_stop">Stop Analysis</string>
+    
+    <!-- Developer Section -->
+    <string name="dev_section_title">Developer Mode (Testing Only)</string>
+    <string name="dev_section_desc">Live camera scan is included only for pipeline debugging.</string>
+    <string name="action_enable_live_cam">Enable Live Sensor Stream (Dev)</string>
+    <string name="dev_warning">⚠️ High CPU Usage - Not for Field Use</string>
+    
+    <!-- Footer -->
+    <string name="footer_build_info">Prototype Build v0.9 | EfficientNetV2-B0</string>
 </resources>

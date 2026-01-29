@@ -70,7 +70,18 @@ class MainActivity : AppCompatActivity() {
     // Hysteresis Constant
     companion object {
         const val MAX_SESSION_EVENTS = 500
+        
+        // Debug TAGs
+        private const val TAG_FRAME = "FRAME_CAPTURE"
+        private const val TAG_FACE = "FACE_PIPELINE"
+        private const val TAG_PREPROCESS = "PREPROCESS"
     }
+    
+    // Debug Tracking Variables
+    private var framesSkipped = 0
+    private var consecutiveNoFace = 0
+    private var lastFaceCount = 0
+    private var lastFrameTimeMs = 0L
     
     // Configurable Settings (Default Values)
     private var highRiskEntry = 0.70f
@@ -176,20 +187,23 @@ class MainActivity : AppCompatActivity() {
         cameraExecutor = Executors.newSingleThreadExecutor()
         
         // Connectivity Logic
+        // Connectivity Logic
         connectivityManager = getSystemService(ConnectivityManager::class.java)
-        val badgeOffline = findViewById<TextView>(R.id.badgeOffline)
+        val chipOffline = findViewById<View>(R.id.chipOfflineStatus)
         
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 runOnUiThread {
-                    badgeOffline.visibility = View.GONE
+                    // In Material 3, we might just dim it or hide it
+                    // For now, let's keep logic: HIDE if online
+                    chipOffline.visibility = View.GONE
                     Log.i("TRUST_BADGE", "Online mode detected")
                 }
             }
 
             override fun onLost(network: Network) {
                 runOnUiThread {
-                    badgeOffline.visibility = View.VISIBLE
+                    chipOffline.visibility = View.VISIBLE
                     Log.i("TRUST_BADGE", "Offline mode active")
                 }
             }
@@ -204,7 +218,7 @@ class MainActivity : AppCompatActivity() {
         val activeNetwork = connectivityManager.activeNetwork
         val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
         val isConnected = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
-        badgeOffline.visibility = if (isConnected) View.GONE else View.VISIBLE
+        chipOffline.visibility = if (isConnected) View.GONE else View.VISIBLE
         Log.i("TRUST_BADGE", "Initial State: ${if (isConnected) "Online" else "Offline"}")
 
         // Initialize Views
@@ -214,7 +228,7 @@ class MainActivity : AppCompatActivity() {
         val viewFinder = findViewById<PreviewView>(R.id.viewFinder)
         
         // Settings Views
-        val btnSettings = findViewById<android.widget.ImageButton>(R.id.btnSettings)
+        val btnSettings = findViewById<android.widget.Button>(R.id.btnSettings)
         val settingsPanel = findViewById<android.widget.ScrollView>(R.id.settingsPanel)
         val btnCloseSettings = findViewById<android.widget.Button>(R.id.btnCloseSettings)
         val btnResetSettings = findViewById<android.widget.Button>(R.id.btnResetSettings)
@@ -351,6 +365,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Set Click Listeners
+        // Set Click Listeners
         btnSelectVideo.setOnClickListener {
             selectedMode = AppMode.VIDEO_MODE
             currentProcessingJob?.cancel() // Stop video loop if running
@@ -360,10 +375,10 @@ class MainActivity : AppCompatActivity() {
             tfliteInterpreter?.resetVariableTensors() // Optional: cleaner state
             Log.i("SESSION_LOG", "Session reset for VIDEO mode")
             
-            // hide banner
-            findViewById<View>(R.id.riskBannerLayout).visibility = View.INVISIBLE
+            // hide developer tools
+            findViewById<View>(R.id.developerContainer).visibility = View.GONE
+            findViewById<View>(R.id.viewFinder).visibility = View.INVISIBLE // Ensure camera hidden
             
-            viewFinder.visibility = View.INVISIBLE // Hide camera
             statusTextView.text = "Video analysis mode selected. Choosing video..."
             Log.d("DeepfakeAI", "Mode changed to: $selectedMode")
             pickVideoLauncher.launch("video/*")
@@ -377,14 +392,21 @@ class MainActivity : AppCompatActivity() {
             sessionStats.reset() // Reset session stats
             Log.i("SESSION_LOG", "Session reset for CAMERA mode")
             
-            // hide banner
-            findViewById<View>(R.id.riskBannerLayout).visibility = View.INVISIBLE
+            // Show Developer Tools
+            val devContainer = findViewById<View>(R.id.developerContainer)
+            if (devContainer.visibility == View.VISIBLE) {
+                devContainer.visibility = View.GONE
+                viewFinder.visibility = View.INVISIBLE
+                (it as android.widget.Button).text = getString(R.string.action_enable_live_cam)
+            } else {
+                devContainer.visibility = View.VISIBLE
+                viewFinder.visibility = View.VISIBLE
+                statusTextView.text = "Developer Live Stream Active"
+                (it as android.widget.Button).text = "Disable Live Sensor Stream"
+                checkCameraPermissionAndStart()
+            }
             
-            statusTextView.text = "Live camera detection mode selected"
-            viewFinder.visibility = View.VISIBLE
-            Log.d("DeepfakeAI", "Mode changed to: $selectedMode")
-            
-            checkCameraPermissionAndStart()
+            Log.d("DeepfakeAI", "Mode toggled for Developer Camera")
         }
     }
 
@@ -473,47 +495,86 @@ class MainActivity : AppCompatActivity() {
     @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class) 
     private fun processCameraFrame(imageProxy: ImageProxy) {
         val currentTimestamp = System.currentTimeMillis()
+        lastFrameTimeMs = currentTimestamp
+        
         // Throttle: 1 FPS (1000ms)
         if (currentTimestamp - lastAnalyzedTimestamp >= 1000) {
             lastAnalyzedTimestamp = currentTimestamp
-            sessionStats.framesProcessed++ // Track frame
+            sessionStats.framesProcessed++
             
             val mediaImage = imageProxy.image
             if (mediaImage != null) {
-                 val bitmap = imageProxy.toBitmap()
+                val bitmap = imageProxy.toBitmap()
                 
-                 faceDetectorHelper?.detectFace(
-                     bitmap = bitmap,
-                     onSuccess = { bounds ->
+                // DEBUG: Log frame capture
+                Log.d(TAG_FRAME, "Frame captured: ${bitmap.width}x${bitmap.height}, format=${bitmap.config}, ts=$currentTimestamp")
+                
+                // DEBUG: Log before face detection
+                Log.d(TAG_FACE, "Running face detection on frame #${sessionStats.framesProcessed}")
+                
+                faceDetectorHelper?.detectFace(
+                    bitmap = bitmap,
+                    onSuccess = { bounds ->
                         runOnUiThread {
                             val statusTextView = findViewById<TextView>(R.id.statusTextView)
                             if (bounds != null) {
-                                sessionStats.facesDetected++ // Track face
-                                Log.i("FACE_DETECTION", "FACE DETECTED bbox=$bounds")
+                                sessionStats.facesDetected++
+                                lastFaceCount = 1
+                                consecutiveNoFace = 0
+                                Log.d(TAG_FACE, "FACE DETECTED! bbox=$bounds, total=${sessionStats.facesDetected}")
                                 statusTextView.text = "Face detected ✅"
                                 
                                 // Preprocess off main thread
                                 processingScope.launch(Dispatchers.Default) {
+                                    Log.d(TAG_PREPROCESS, "Preprocessing face...")
                                     preprocessFaceForModel(bitmap, bounds)
                                 }
                             } else {
-                                Log.i("FACE_DETECTION", "NO FACE DETECTED")
+                                lastFaceCount = 0
+                                consecutiveNoFace++
+                                Log.d(TAG_FACE, "NO FACE detected. Consecutive misses: $consecutiveNoFace")
                                 statusTextView.text = "No face detected ❌"
                             }
+                            
+                            // Update debug stats UI
+                            updateDebugStats()
                         }
-                     },
-                     onError = { e ->
-                        Log.e("FACE_DETECTION", "Error in detection", e)
-                     }
-                 )
-                 
-                 // Initial UI update
-                 runOnUiThread {
+                    },
+                    onError = { e ->
+                        Log.e(TAG_FACE, "Face detection FAILED", e)
+                        consecutiveNoFace++
+                        runOnUiThread { updateDebugStats() }
+                    }
+                )
+                
+                // Initial UI update
+                runOnUiThread {
                     findViewById<TextView>(R.id.statusTextView).text = "Analyzing Camera Frame..."
-                 }
+                }
+            } else {
+                Log.w(TAG_FRAME, "mediaImage is NULL, skipping frame")
+                framesSkipped++
             }
+        } else {
+            framesSkipped++
         }
         imageProxy.close()
+    }
+    
+    private fun updateDebugStats() {
+        val tvDebugStats = findViewById<TextView>(R.id.tvDebugStats)
+        val elapsedSec = (System.currentTimeMillis() - sessionStats.sessionStartTime) / 1000.0
+        val fps = if (elapsedSec > 0) sessionStats.framesProcessed / elapsedSec else 0.0
+        
+        val warning = if (consecutiveNoFace >= 30) {
+            "\n⚠️ NO FACES FOR 30+ FRAMES: Check lighting/rotation/input"
+        } else ""
+        
+        tvDebugStats.text = """DEBUG STATS
+|Frames: ${sessionStats.framesProcessed} | Skipped: $framesSkipped
+|Faces: ${sessionStats.facesDetected} | LastCount: $lastFaceCount
+|Inferences: ${sessionStats.inferenceCalls} | NoFaceStreak: $consecutiveNoFace
+|FPS: ${"%.1f".format(fps)} | Elapsed: ${"%.1f".format(elapsedSec)}s$warning""".trimMargin()
     }
 
     private fun processVideo(videoUri: Uri) {
@@ -770,34 +831,37 @@ class MainActivity : AppCompatActivity() {
     }
     
     private fun updateRiskVisuals(riskLevel: RiskLevel, confidence: Float) {
-        val bannerLayout = findViewById<androidx.constraintlayout.widget.ConstraintLayout>(R.id.riskBannerLayout)
-        val bannerIcon = findViewById<android.widget.ImageView>(R.id.riskIcon)
-        val bannerText = findViewById<TextView>(R.id.riskBannerText)
+        // Material 3 Card UI Updates
+        val cardScore = findViewById<com.google.android.material.card.MaterialCardView>(R.id.cardScore)
+        val tvRiskLabel = findViewById<TextView>(R.id.tvRiskLabel)
+        val tvScorePercent = findViewById<TextView>(R.id.tvScorePercent)
+        val progressRisk = findViewById<com.google.android.material.progressindicator.LinearProgressIndicator>(R.id.progressRisk)
         
-        // Ensure visible
-        if (bannerLayout.visibility != View.VISIBLE) {
-            bannerLayout.visibility = View.VISIBLE
-            bannerLayout.animate().alpha(1f).setDuration(300).start()
-        }
-        
-        // Update Content
+        // Calculate percentage
         val percentage = (confidence * 100).toInt()
-        bannerIcon.setImageResource(riskLevel.iconResId)
-        bannerText.text = "${riskLevel.displayName}\nDeepfake likelihood: $percentage%"
         
-        // Animate Color Change (Simple substitution for now, could use ValueAnimator for smooth color)
-        val color = riskLevel.colorHex
+        // Update Text
+        tvScorePercent.text = "${percentage}%"
+        tvRiskLabel.text = riskLevel.displayName.uppercase()
+        tvRiskLabel.setTextColor(riskLevel.colorHex)
         
-        // Semi-transparent background for banner
-        // We'll apply the color with some transparency
-        val backgroundDrawable = android.graphics.drawable.GradientDrawable()
-        backgroundDrawable.setColor(color)
-        backgroundDrawable.cornerRadius = 16f // 8dp -> 16px approx
-        backgroundDrawable.alpha = 230 // 0-255
+        // Update Progress
+        // Animate progress for smoothness
+        progressRisk.setProgressCompat(percentage, true)
+        progressRisk.setIndicatorColor(riskLevel.colorHex)
         
-        bannerLayout.background = backgroundDrawable
+        // Update Card Color (Subtle Tint Strategy)
+        // We use a dark surface with a slight tint of the risk color
+        // Base color: #1E1E1E. Risk color: riskLevel.colorHex.
+        // We can't easily blend mechanically without utils, so let's stick to border color or strict mapping.
         
-        // Log only on state change or significant update (handled by caller mostly, but useful here)
+        cardScore.strokeColor = riskLevel.colorHex
+        cardScore.strokeWidth = 4 // Make it visible
+        
+        // Optional: Set card background to a very dark version of the risk color
+        // For now, stroke and text color is sufficient for "Security Grade" look
+        
+        Log.i("RISK_UI", "Updated Risk UI: ${riskLevel.displayName} $percentage%")
     }
     
     private fun updateSessionSummaryUI() {
