@@ -192,4 +192,10 @@ Open for collaboration & research partnerships 🤝
 
 ---
 
+## Download APK
+
+Go to Releases → Download latest APK
+
+---
+
 ### 🛡️ Abhaya-Netra — Autonomous Defence Against Synthetic Media Threats.
